@@ -25,7 +25,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include "sipf_client.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,28 +38,87 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define SW_POLL_TIMEOUT	(100)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define UART_HANDLE_STLINK	(&hlpuart1)
+#define UART_HANDLE_NRF9160	(&huart1)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+static uint8_t buff[256];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+void SipfClientUartInit(UART_HandleTypeDef *puart);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+int print_msg(const char *fmt, ...)
+{
+    static char msg[128];
+    int  len;
 
+    va_list list;
+    va_start(list, fmt);
+    len = vsprintf(msg, fmt, list);
+    va_end(list);
+
+    HAL_UART_Transmit(UART_HANDLE_STLINK, (uint8_t*)msg, len, 100);
+
+    return len;
+}
+
+static void requestResetModule(void)
+{
+	// Reset request.
+	HAL_GPIO_WritePin(OUTPUT_WAKE_IN_GPIO_Port, OUTPUT_WAKE_IN_Pin, GPIO_PIN_SET);
+	HAL_Delay(10);
+	HAL_GPIO_WritePin(OUTPUT_WAKE_IN_GPIO_Port, OUTPUT_WAKE_IN_Pin, GPIO_PIN_RESET);
+
+	HAL_Delay(200);
+}
+
+static int waitBootModule(void)
+{
+	int len, is_echo = 0;
+
+	// Wait READY message.
+	for (;;) {
+		len = SipfUtilReadLine(buff, sizeof(buff), 65000);
+		if (len < 0) {
+			// ERROR or BUSY or TIMEOUT
+			return len;
+		}
+		if (len == 0) {
+			continue;
+		}
+		if (len >= 13) {
+			if (memcmp(buff, "*** SIPF Client", 15) == 0) {
+				is_echo = 1;
+			}
+			//Detect READY message.
+			if (memcmp(buff, "+++ Ready +++", 13) == 0) {
+				break;
+			}
+			if (memcmp(buff, "ERR:Faild", 9) == 0) {
+				print_msg("%s\r\n", buff);
+				return -1;
+			}
+		}
+		if (is_echo) {
+			print_msg("%s\r\n", buff);
+		}
+	}
+	return 0;
+}
 /* USER CODE END 0 */
 
 /**
@@ -66,7 +128,7 @@ void SystemClock_Config(void);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-
+  int ret;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -91,16 +153,82 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  print_msg("*** SIPF Client for Nucleo ***\r\n");
 
+  SipfClientUartInit(UART_HANDLE_NRF9160);
+
+  print_msg("Request module reset.\r\n");
+  requestResetModule();
+
+  print_msg("Waiting module boot\r\n");
+  print_msg("### MODULE OUTPUT ###\r\n");
+  ret = waitBootModule();
+  if (ret != 0) {
+	  print_msg("FAILED(%d)\r\n", ret);
+	  return -1;
+  }
+  print_msg("#####################\r\n");
+  print_msg("OK\r\n");
+
+  HAL_Delay(100);
+
+  print_msg("Set Auth mode... ");
+  ret = SipfSetAuthMode(0x01);
+  if (ret != 0) {
+	print_msg((char *)buff, "FAILED(%d)\r\n", ret);
+	return -1;
+  }
+  print_msg("OK\r\n");
+
+  SipfClientFlushReadBuff();
+
+  print_msg("+++ Ready +++\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t count_tx = 1;
+  uint32_t poll_timeout = uwTick + SW_POLL_TIMEOUT;
+  GPIO_PinState prev_ps = GPIO_PIN_SET;
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	uint8_t b;
+	for (;;) {
+		if (SipfClientUartReadByte(&b) != -1) {
+			HAL_UART_Transmit(UART_HANDLE_STLINK, &b, 1, 0);
+		} else {
+			break;
+		}
+	}
+	for (;;) {
+		if (HAL_UART_Receive(UART_HANDLE_STLINK, &b, 1, 0) == HAL_OK) {
+			SipfClientUartWriteByte(b);
+		} else {
+			break;
+		}
+	}
+
+	// B2 Push
+	if (((int)poll_timeout - (int)uwTick) <= 0) {
+		poll_timeout = uwTick + SW_POLL_TIMEOUT;
+		GPIO_PinState ps;
+		ps = HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin);
+		if ((prev_ps == GPIO_PIN_SET) && (ps == GPIO_PIN_RESET)) {
+			print_msg("B1 PUSHED\r\nTX(tag_id: 0x01, type: 0x04, value: %d)\r\n", count_tx);
+			memset(buff, 0, sizeof(buff));
+			ret = SipfCmdTx(0x01, 0x04, (uint8_t*)&count_tx, 4, buff);
+			if (ret == 0) {
+				print_msg("OK(OTID: %s)\r\n", buff);
+				count_tx++;
+			} else {
+				print_msg("NG\r\n");
+			}
+		}
+		prev_ps = ps;
+	}
   }
   /* USER CODE END 3 */
 }
